@@ -1,75 +1,153 @@
 """
-Genera index.html interactivo a partir del markdown del libro de Max Schulkin.
-Fuente: raw_otra_coronacion_de_gloria.md
-v2: uses MD source – tables, lists, images, headings, fixed scroll TOC
+Genera index.html interactivo, raw_otra_coronacion_de_gloria.md y book_content.json
+a partir del .docx del libro de Max Schulkin.
+
+Fuente única de verdad: raw_otra_coronacion_de_gloria.docx
+Pipeline: docx --(pandoc)--> markdown --(limpieza)--> render --> index.html
+
+Requisitos: pandoc en PATH, paquetes python `markdown` y `python-docx`.
+Uso: python build_book.py
 """
-import re, html as html_module, markdown as md_lib
+import os, re, json, base64, html as html_module, subprocess, tempfile, shutil
+import markdown as md_lib
+
+BASE   = os.path.dirname(os.path.abspath(__file__))
+DOCX   = os.path.join(BASE, 'raw_otra_coronacion_de_gloria.docx')
+MD_OUT = os.path.join(BASE, 'raw_otra_coronacion_de_gloria.md')
+JSON_OUT = os.path.join(BASE, 'book_content.json')
+HTML_OUT = os.path.join(BASE, 'index.html')
 
 # ═══════════════════════════════════════════════════════════════
-# 1. LEER Y PREPROCESAR EL MARKDOWN
+# 1. DOCX → MARKDOWN (pandoc) + extracción de imágenes
 # ═══════════════════════════════════════════════════════════════
 
-with open(r'C:\Users\JM\Desktop\MAX SCHULKIN\raw_otra_coronacion_de_gloria.md', encoding='utf-8') as f:
-    raw = f.read()
-
-# Fix cita Perón: indentación ≥4 espacios → bloque de código en MD
-raw = re.sub(r'(?m)^ {4,}(\*– Juan D\. Perón\*)\s*$', r'\n> \1', raw)
-
-# Convertir labels en negrita a headings reales con IDs explícitos
-raw = raw.replace('\n**Agradecimientos**\n', '\n## Agradecimientos {#agradecimientos}\n')
-raw = raw.replace('\n**Sobre el autor**\n',  '\n## Sobre el autor {#sobre-el-autor}\n')
-
-# Eliminar TOC interno del libro (bloque de vínculos con números de página)
-toc_start = raw.find('[**Introducción\t')
-intro_mk   = '# **Introducción** {#introducción}'
-intro_pos  = raw.find(intro_mk)
-if toc_start > 0 and intro_pos > toc_start:
-    raw = raw[:toc_start] + raw[intro_pos:]
-
-# Eliminar headings vacíos usados como espaciado
-raw = re.sub(r'(?m)^#{1,6}\s*\n', '\n', raw)
-
-# Convertir tablas de una sola columna (cajas de nota) en divs callout
-# Patrón: | texto |\n| :---- |\n  (sin filas de datos)
-def replace_callout_table(m):
-    content = m.group(1).strip()
-    # keep inline markdown inside the content
-    return f'\n<div class="callout">{content}</div>\n\n'
-raw = re.sub(r'(?m)^\| (.+?) \|\n\| :---+[^|\n]* \|\n(?!\|)', replace_callout_table, raw)
-
-# Normalizar indentación de listas anidadas para Python Markdown (necesita 4 espacios)
-# Fuente exportada de Google Docs usa 3 espacios para listas numeradas y 2 para bullets
-def fix_list_indent(text):
-    def replacer(m):
-        n = len(m.group(1))
-        marker = m.group(2)
-        # map indent level: 1-3 → 4, 4-7 → 8, 8-11 → 12, etc.
-        level = (n - 1) // 3 + 1
-        return ' ' * (level * 4) + marker + ' '
-    return re.sub(r'(?m)^( {1,11})([-*+]|\d+\.) ', replacer, text)
-raw = fix_list_indent(raw)
-
-# Eliminar trailing double-spaces de líneas de lista (evita <br> antes de sub-lista)
-raw = re.sub(r'(?m)^([ \t]*[-*+0-9][^\n]+?)  $', r'\1', raw)
+def docx_to_markdown(docx_path):
+    """Convierte el docx a markdown con pandoc y devuelve (md, {nombre: bytes})."""
+    tmp = tempfile.mkdtemp(prefix='ocg_')
+    try:
+        md = subprocess.run(
+            ['pandoc', docx_path, '-t', 'markdown', '--wrap=none',
+             f'--extract-media={tmp}'],
+            check=True, capture_output=True, text=True, encoding='utf-8'
+        ).stdout
+        media = {}
+        media_dir = os.path.join(tmp, 'media')
+        if os.path.isdir(media_dir):
+            for name in os.listdir(media_dir):
+                with open(os.path.join(media_dir, name), 'rb') as fh:
+                    media[name] = fh.read()
+        return md, media
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 # ═══════════════════════════════════════════════════════════════
-# 2. RENDERIZAR MARKDOWN
+# 2. LIMPIEZA Y NORMALIZACIÓN DEL MARKDOWN
 # ═══════════════════════════════════════════════════════════════
 
-proc = md_lib.Markdown(extensions=['extra', 'sane_lists', 'toc'])
-body_html = proc.convert(raw)
+MIME = {'.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif'}
+
+def clean_markdown(raw, media):
+    # 2.1 Spans de dirección RTL que pandoc añade a comillas: [X]{dir="rtl"} → X
+    raw = re.sub(r'\[(.)\]\{dir="[^"]*"\}', r'\1', raw)
+
+    # 2.2 Títulos de capítulo: en el docx usan un estilo propio que pandoc no mapea
+    #     a heading, sino a un span ancla .anchor seguido del texto del título.
+    #     Forma inline:    []{#id .anchor}Capítulo N: ...
+    raw = re.sub(r'(?m)^\[\]\{#\S+ \.anchor\}(.+)$', r'# \1', raw)
+    #     Forma en línea propia: []{#id .anchor}\n\nTítulo
+    raw = re.sub(r'(?m)^\[\]\{#\S+ \.anchor\}\n\n(.+)$', r'# \1', raw)
+    #     Cualquier ancla vacía remanente
+    raw = re.sub(r'(?m)^\[\]\{#\S+ \.anchor\}\s*$\n?', '', raw)
+
+    # 2.3 Eliminar el índice interno del docx (líneas "Texto [pág](#ancla)")
+    raw = re.sub(r'(?m)^.*\[\d+\]\(#[^)]*\)\s*$\n?', '', raw)
+
+    # 2.4 Incrustar imágenes como data URI (self-contained, sin carpeta media/)
+    def embed_image(m):
+        path = m.group(1)
+        name = os.path.basename(path)
+        data = media.get(name)
+        if data is None:
+            return ''
+        ext = os.path.splitext(name)[1].lower()
+        mime = MIME.get(ext, 'application/octet-stream')
+        b64 = base64.b64encode(data).decode('ascii')
+        return f'![](data:{mime};base64,{b64})'
+    raw = re.sub(r'!\[[^\]]*\]\(([^)]+)\)(\{[^}]*\})?', embed_image, raw)
+
+    # 2.45 Tablas grid de pandoc (+---+) → HTML (Python-Markdown no las parsea).
+    #      Se promueve la primera fila a encabezado y se delega el render a pandoc.
+    def convert_grid_table(m):
+        lines = m.group(0).rstrip('\n').split('\n')
+        borders = [i for i, ln in enumerate(lines) if ln.startswith('+')]
+        if len(borders) >= 2:  # 2º borde = separador de encabezado
+            b = borders[1]
+            lines[b] = lines[b].replace('-', '=')
+        block = '\n'.join(lines) + '\n'
+        html = subprocess.run(
+            ['pandoc', '-f', 'markdown', '-t', 'html'],
+            input=block, capture_output=True, text=True, encoding='utf-8'
+        ).stdout.strip()
+        return '\n\n' + html + '\n\n'
+    raw = re.sub(r'(?m)^\+[-=+]+\+\n(?:[|+].*\n)+', convert_grid_table, raw)
+
+    # 2.5 Portada: separar el bloque del título del resto del cuerpo.
+    #     El cuerpo aprovechable empieza en "**Agradecimientos**".
+    agr = raw.find('**Agradecimientos**')
+    if agr > 0:
+        raw = raw[agr:]
+
+    # 2.6 Convertir labels en negrita a headings reales
+    raw = raw.replace('**Agradecimientos**', '## Agradecimientos', 1)
+    raw = raw.replace('**Sobre el autor**',  '## Sobre el autor', 1)
+
+    # 2.7 Normalizar indentación de listas anidadas para Python Markdown (4 espacios)
+    def fix_list_indent(text):
+        def replacer(m):
+            n = len(m.group(1)); marker = m.group(2)
+            level = (n - 1) // 3 + 1
+            return ' ' * (level * 4) + marker + ' '
+        return re.sub(r'(?m)^( {1,11})([-*+]|\d+\.) ', replacer, text)
+    raw = fix_list_indent(raw)
+
+    # 2.8 Tablas de una sola columna (cajas de nota) → divs callout
+    def replace_callout_table(m):
+        return f'\n<div class="callout">{m.group(1).strip()}</div>\n\n'
+    raw = re.sub(r'(?m)^\| (.+?) \|\n\| :---+[^|\n]* \|\n(?!\|)', replace_callout_table, raw)
+
+    # 2.9 Compactar saltos de línea múltiples
+    raw = re.sub(r'\n{3,}', '\n\n', raw).strip() + '\n'
+    return raw
 
 # ═══════════════════════════════════════════════════════════════
-# 3. CONSTRUIR SIDEBAR TOC DESDE toc_tokens
+# 3. book_content.json (estructura {style, text} desde el docx)
+# ═══════════════════════════════════════════════════════════════
+
+def build_book_content_json(docx_path):
+    import docx
+    doc = docx.Document(docx_path)
+    style_map = {'Body A': 'normal', 'Normal': 'normal', 'List Paragraph': 'normal',
+                 'Title A': 'Title', 'Title': 'Title', 'Heading': 'Heading 1'}
+    out = []
+    for p in doc.paragraphs:
+        text = p.text.strip()
+        if not text:
+            continue
+        name = p.style.name if p.style else 'Normal'
+        if name.startswith('TOC'):
+            continue
+        style = style_map.get(name, name)
+        out.append({'style': style, 'text': text})
+    return out
+
+# ═══════════════════════════════════════════════════════════════
+# 4. SIDEBAR TOC
 # ═══════════════════════════════════════════════════════════════
 
 def render_toc(tokens):
-    """Genera HTML del TOC; omite el primer token (título = portada)."""
-    items = tokens[1:]   # skip book title
     parts = ['<ul class="toc-root">']
-    for tok in items:
-        title    = tok['name']
-        tid      = tok['id']
+    for tok in tokens:
+        title, tid = tok['name'], tok['id']
         children = tok.get('children', [])
         if tok['level'] == 1:
             parts.append(f'<li class="toc-ch"><a href="#{tid}" class="toc-ch-link">{html_module.escape(title)}</a>')
@@ -78,44 +156,15 @@ def render_toc(tokens):
                 for sec in children:
                     parts.append(
                         f'<li><a href="#{sec["id"]}" class="toc-sec-link">'
-                        f'{html_module.escape(sec["name"])}</a></li>'
-                    )
+                        f'{html_module.escape(sec["name"])}</a></li>')
                 parts.append('</ul>')
             parts.append('</li>')
-        else:  # H2 frontmatter antes del primer H1
+        else:  # frontmatter (H2 antes del primer H1)
             parts.append(
                 f'<li class="toc-ch"><a href="#{tid}" class="toc-ch-link toc-front">'
-                f'{html_module.escape(title)}</a></li>'
-            )
+                f'{html_module.escape(title)}</a></li>')
     parts.append('</ul>')
     return ''.join(parts)
-
-toc_sidebar_html = render_toc(proc.toc_tokens)
-
-# ═══════════════════════════════════════════════════════════════
-# 4. EXTRAER PORTADA Y SEPARAR DEL CUERPO
-# ═══════════════════════════════════════════════════════════════
-
-portada_title    = 'Otra Coronación de Gloria'
-portada_subtitle = 'Con los dirigentes a la cabeza<br>o con la cabeza de los dirigentes'
-portada_attr     = '– Juan D. Perón'
-
-# Remover el bloque portada del body_html (h1 + párrafos de subtítulo + quote)
-h1_open = '<h1 id="otra-coronacion-de-gloria">'
-h1_pos  = body_html.find(h1_open)
-bq_end  = body_html.find('</blockquote>', h1_pos)
-if bq_end > h1_pos:
-    body_after_portada = body_html[bq_end + len('</blockquote>'):]
-else:
-    body_after_portada = body_html
-
-portada_html = f"""<div id="portada" class="portada">
-  <h1>{html_module.escape(portada_title)}</h1>
-  <div class="divider"></div>
-  <p class="sub">{portada_subtitle}</p>
-  <p class="attr"><em>{html_module.escape(portada_attr)}</em></p>
-  <p class="author">Maximiliano Schulkin</p>
-</div>"""
 
 # ═══════════════════════════════════════════════════════════════
 # 5. CSS
@@ -219,7 +268,6 @@ window.addEventListener('scroll', () => {
 const wc = document.getElementById('content').innerText.split(/\s+/).length;
 document.getElementById('reading-time').textContent = 'Tiempo de lectura: ~' + Math.ceil(wc/200) + ' min';
 
-// Active TOC – scroll only the sidebar, not the page
 const tocEl   = document.getElementById('toc-scroll');
 const tocLinks = Array.from(document.querySelectorAll('#toc-scroll a[href^="#"]'));
 const headEls  = tocLinks.map(a => document.getElementById(a.getAttribute('href').slice(1))).filter(Boolean);
@@ -229,7 +277,6 @@ function setActive(id) {
   const a = document.querySelector('#toc-scroll a[href="#' + id + '"]');
   if (!a) return;
   a.classList.add('active');
-  // scroll only the sidebar container
   const linkTop = a.offsetTop;
   const sh = tocEl.clientHeight;
   if (linkTop < tocEl.scrollTop + 60 || linkTop > tocEl.scrollTop + sh - 60) {
@@ -250,7 +297,6 @@ window.addEventListener('scroll', () => {
   });
 }, {passive:true});
 
-// Font size
 const content = document.getElementById('content');
 const sizes = ['fs-sm','fs-md','fs-lg','fs-xl'];
 let si = 1; content.classList.add(sizes[si]);
@@ -261,14 +307,12 @@ document.getElementById('fs-up').addEventListener('click', () => {
   content.classList.remove(sizes[si]); si = Math.min(sizes.length-1, si+1); content.classList.add(sizes[si]);
 });
 
-// Dark mode
 const themeBtn = document.getElementById('theme-btn');
 let dark = window.matchMedia('(prefers-color-scheme: dark)').matches;
 const applyTheme = () => { document.documentElement.dataset.theme = dark ? 'dark' : ''; themeBtn.textContent = dark ? '☀️' : '🌙'; };
 applyTheme();
 themeBtn.addEventListener('click', () => { dark = !dark; applyTheme(); });
 
-// Mobile sidebar
 const sidebar = document.getElementById('sidebar');
 const overlay = document.getElementById('overlay');
 document.getElementById('menu-btn').addEventListener('click', () => {
@@ -281,10 +325,37 @@ document.querySelectorAll('#toc-scroll a').forEach(a => a.addEventListener('clic
 """
 
 # ═══════════════════════════════════════════════════════════════
-# 7. ENSAMBLAR HTML FINAL
+# 7. PORTADA
 # ═══════════════════════════════════════════════════════════════
 
-HTML = f"""<!DOCTYPE html>
+PORTADA_HTML = """<div id="portada" class="portada">
+  <h1>Otra Coronación de Gloria</h1>
+  <div class="divider"></div>
+  <p class="sub">Con los dirigentes a la cabeza<br>o con la cabeza de los dirigentes</p>
+  <p class="attr"><em>– Juan D. Perón</em></p>
+  <p class="author">Maximiliano Schulkin</p>
+</div>"""
+
+# ═══════════════════════════════════════════════════════════════
+# 8. MAIN
+# ═══════════════════════════════════════════════════════════════
+
+def main():
+    raw_md, media = docx_to_markdown(DOCX)
+    clean = clean_markdown(raw_md, media)
+
+    with open(MD_OUT, 'w', encoding='utf-8') as f:
+        f.write(clean)
+
+    book_json = build_book_content_json(DOCX)
+    with open(JSON_OUT, 'w', encoding='utf-8') as f:
+        json.dump(book_json, f, ensure_ascii=False)
+
+    proc = md_lib.Markdown(extensions=['extra', 'sane_lists', 'toc', 'smarty'])
+    body_html = proc.convert(clean)
+    toc_sidebar_html = render_toc(proc.toc_tokens)
+
+    HTML = f"""<!DOCTYPE html>
 <html lang="es">
 <head>
 <meta charset="UTF-8">
@@ -315,19 +386,23 @@ HTML = f"""<!DOCTYPE html>
     <button class="tb-btn" id="theme-btn">🌙</button>
   </div>
   <div id="content">
-    {portada_html}
-    {body_after_portada}
+    {PORTADA_HTML}
+    {body_html}
   </div>
 </div>
 <script>{JS}</script>
 </body>
 </html>"""
 
-out = r'C:\Users\JM\Desktop\MAX SCHULKIN\index.html'
-with open(out, 'w', encoding='utf-8') as f:
-    f.write(HTML)
-print(f'OK → {len(HTML):,} chars written to {out}')
+    with open(HTML_OUT, 'w', encoding='utf-8') as f:
+        f.write(HTML)
+
+    print(f'OK')
+    print(f'  md   → {MD_OUT} ({len(clean):,} chars)')
+    print(f'  json → {JSON_OUT} ({len(book_json)} entries)')
+    print(f'  html → {HTML_OUT} ({len(HTML):,} chars)')
+    print(f'  toc  → {len(proc.toc_tokens)} top-level entries')
 
 
-# end of script
-
+if __name__ == '__main__':
+    main()
