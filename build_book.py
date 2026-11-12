@@ -1,143 +1,210 @@
 """
 Genera index.html interactivo, raw_otra_coronacion_de_gloria.md y book_content.json
-a partir del .docx del libro de Max Schulkin.
+a partir de las fuentes LaTeX del libro de Max Schulkin.
 
-Fuente única de verdad: raw_otra_coronacion_de_gloria.docx
-Pipeline: docx --(pandoc)--> markdown --(limpieza)--> render --> index.html
+Fuente única de verdad: ../otracoronacion/otra_coronacion_latex/main.tex
+(otra ruta: variable de entorno OCG_LATEX_DIR)
+Pipeline: LaTeX --(conversor propio)--> markdown --(Python-Markdown)--> index.html
 
-Requisitos: pandoc en PATH, paquetes python `markdown` y `python-docx`.
+Requisitos: paquete python `markdown`.
 Uso: python build_book.py
 """
-import os, re, json, base64, html as html_module, subprocess, tempfile, shutil
+import os, re, json, html as html_module, unicodedata
 import markdown as md_lib
 
 BASE   = os.path.dirname(os.path.abspath(__file__))
-DOCX   = os.path.join(BASE, 'raw_otra_coronacion_de_gloria.docx')
+LATEX_DIR = os.environ.get('OCG_LATEX_DIR',
+                           os.path.join(BASE, '..', 'otracoronacion', 'otra_coronacion_latex'))
 MD_OUT = os.path.join(BASE, 'raw_otra_coronacion_de_gloria.md')
 JSON_OUT = os.path.join(BASE, 'book_content.json')
 HTML_OUT = os.path.join(BASE, 'index.html')
 
 # ═══════════════════════════════════════════════════════════════
-# 1. DOCX → MARKDOWN (pandoc) + extracción de imágenes
+# 1. LaTeX → MARKDOWN
+#    Cubre solo el subconjunto que usa el libro: \capitulo, \chapter*, secciones,
+#    itemize/enumerate (anidadas, etiquetas a) e i.), tabularx con booktabs,
+#    \emph \textbf \textsubscript \url \footnote \cite y thebibliography.
 # ═══════════════════════════════════════════════════════════════
 
-def docx_to_markdown(docx_path):
-    """Convierte el docx a markdown con pandoc y devuelve (md, {nombre: bytes})."""
-    tmp = tempfile.mkdtemp(prefix='ocg_')
-    try:
-        md = subprocess.run(
-            ['pandoc', docx_path, '-t', 'markdown', '--wrap=none',
-             f'--extract-media={tmp}'],
-            check=True, capture_output=True, text=True, encoding='utf-8'
-        ).stdout
-        media = {}
-        media_dir = os.path.join(tmp, 'media')
-        if os.path.isdir(media_dir):
-            for name in os.listdir(media_dir):
-                with open(os.path.join(media_dir, name), 'rb') as fh:
-                    media[name] = fh.read()
-        return md, media
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+def read_sources(latex_dir):
+    """Devuelve el texto concatenado de los \\input del cuerpo de main.tex, en orden."""
+    main = open(os.path.join(latex_dir, 'main.tex'), encoding='utf-8').read()
+    main = main[main.index(r'\begin{document}'):]
+    names = re.findall(r'(?m)^[^%\n]*\\input\{([^}]+)\}', main)
+    return [open(os.path.join(latex_dir, n + '.tex'), encoding='utf-8').read() for n in names]
+
+
+class Converter:
+    def __init__(self, bib_keys):
+        self.ref_num = {k: i + 1 for i, k in enumerate(bib_keys)}
+        self.footnotes = []   # definiciones markdown [^n]: ...
+        self.ol_types = []    # tipo de cada <ol> en orden de aparición (None, 'a', 'i')
+        self.cap = 0
+
+    # ── inline ────────────────────────────────────────────────
+    def cite(self, m):
+        opt, keys = m.group(1), m.group(2).split(',')
+        links = [f'<a href="#ref-{self.ref_num[k.strip()]}">{self.ref_num[k.strip()]}</a>'
+                 for k in keys]
+        extra = f', {opt}' if opt else ''
+        return '<span class="cite">[' + ', '.join(links) + extra + ']</span>'
+
+    def inline(self, s):
+        urls = []
+        def url(m):
+            u = re.sub(r'\\([_%#&$])', r'\1', m.group(1))
+            urls.append(f'<a href="{html_module.escape(u)}">{html_module.escape(u)}</a>')
+            return f'\x00{len(urls) - 1}\x00'
+        s = re.sub(r'\\url\{([^}]*)\}', url, s)
+        s = s.replace('<', '&lt;').replace('>', '&gt;').replace(r'\&', '&amp;')
+        s = re.sub(r'\\cite(?:\[([^\]]*)\])?\{([^}]*)\}', self.cite, s)
+        tags = {'emph': 'em', 'textbf': 'strong', 'textsubscript': 'sub'}
+        def cmd(m):
+            name, body = m.group(1), m.group(2)
+            if name == 'footnote':
+                self.footnotes.append(tidy(body))
+                return f'[^{len(self.footnotes)}]'
+            return f'<{tags[name]}>{body}</{tags[name]}>'
+        pat = re.compile(r'\\(emph|textbf|textsubscript|footnote)\{([^{}]*)\}')
+        def tidy(t):
+            t = re.sub(r'\\(small|noindent)\b\s*', '', t)
+            t = re.sub(r'\\([%$_#])', r'\1', t).replace('~', '\u00a0').replace('\\\\', '<br>')
+            t = t.replace('{', '').replace('}', '')
+            return re.sub(r'\s+', ' ', t).strip()
+        while pat.search(s):   # de adentro hacia afuera (anidamiento)
+            s = pat.sub(cmd, s)
+        s = tidy(s)
+        return re.sub('\x00(\\d+)\x00', lambda m: urls[int(m.group(1))], s)
+
+    # ── bloques ───────────────────────────────────────────────
+    def heading(self, m):
+        cmd, title = m.group(1), self.inline(m.group(2))
+        if cmd == 'capitulo':
+            self.cap += 1
+            return f'\n\n# Capítulo {self.cap}: {title}\n\n'
+        level = {'chapter*': 1, 'section': 2, 'subsection': 3, 'subsubsection': 4}[cmd]
+        return f'\n\n{"#" * level} {title}\n\n'
+
+    def table(self, m):
+        body = m.group(1).replace(r'\toprule', '').replace(r'\bottomrule', '')
+        head, rows = body.split(r'\midrule')
+        def cells(row):
+            return '| ' + ' | '.join(self.inline(c) for c in re.split(r'(?<!\\)&', row)) + ' |'
+        head_rows = [r for r in head.split('\\\\') if r.strip()]
+        body_rows = [r for r in rows.split('\\\\') if r.strip()]
+        n = len(re.split(r'(?<!\\)&', head_rows[0]))
+        lines = [cells(head_rows[0]), '|' + ' --- |' * n] + [cells(r) for r in body_rows]
+        return '\n\n' + '\n'.join(lines) + '\n\n'
+
+    def paragraphs(self, s):
+        out = []
+        for chunk in re.split(r'\n\s*\n', s):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            if chunk.startswith(('#', '|')):   # heading o tabla ya convertidos
+                out.append(chunk)
+            else:
+                p = self.inline(chunk)
+                out.append(re.sub(r'^(\d+)\. ', r'\1\\. ', p))  # que no se lea como lista
+        return out
+
+    LIST = re.compile(r'\\begin\{(itemize|enumerate)\}(?:\[label=\\(alph|roman)\*[.)]\])?'
+                      r'|\\end\{(?:itemize|enumerate)\}|\\item\b')
+
+    def render(self, s):
+        """Bloques markdown de s, con listas (posiblemente anidadas)."""
+        out, i = [], 0
+        while True:
+            m = self.LIST.search(s, i)
+            if not m:
+                break
+            assert m.group(0).startswith(r'\begin'), f'lista mal formada: {s[m.start():m.start()+80]!r}'
+            out += self.paragraphs(s[i:m.start()])
+            j, depth, items, item_start = m.end(), 1, [], None
+            while depth:
+                t = self.LIST.search(s, j)
+                tok = t.group(0)
+                if tok.startswith(r'\begin'):
+                    depth += 1
+                elif tok.startswith(r'\end'):
+                    depth -= 1
+                elif depth == 1:
+                    if item_start is not None:
+                        items.append(s[item_start:t.start()])
+                    item_start = t.end()
+                j = t.end()
+                if depth == 0 and item_start is not None:
+                    items.append(s[item_start:t.start()])
+            ordered = m.group(1) == 'enumerate'
+            if ordered:
+                self.ol_types.append({'alph': 'a', 'roman': 'i'}.get(m.group(2)))
+            blocks = []
+            for n, item in enumerate(items, 1):
+                marker = f'{n}. ' if ordered else '- '
+                sub = '\n\n'.join(self.render(item)).split('\n')
+                blocks.append('\n'.join([marker + sub[0]] + [('    ' + l) if l else '' for l in sub[1:]]))
+            # con sublistas, Python-Markdown necesita líneas en blanco entre ítems
+            out.append(('\n\n' if any('\n' in b for b in blocks) else '\n').join(blocks))
+            i = j
+        return out + self.paragraphs(s[i:])
+
+    def convert(self, body):
+        body = re.sub(r'\\addcontentsline\{[^}]*\}\{[^}]*\}\{[^}]*\}', '', body)
+        body = re.sub(r'\\begin\{center\}\s*(?:\\small)?\s*\\begin\{tabularx\}\{[^}]*\}\{[^}]*\}'
+                      r'(.*?)\\end\{tabularx\}\s*\\end\{center\}', self.table, body, flags=re.S)
+        body = re.sub(r'(?m)^\\(capitulo|chapter\*|section|subsection|subsubsection)\{(.*)\}\s*$',
+                      self.heading, body)
+        md = '\n\n'.join(self.render(body))
+        notes = '\n\n'.join(f'[^{i}]: {n}'
+                            for i, n in enumerate(self.footnotes, 1))
+        return md + ('\n\n' + notes if notes else '')
+
+
+def latex_to_markdown(latex_dir):
+    """Devuelve (markdown, tipos de <ol> en orden). Las referencias van como HTML con ids."""
+    parts = read_sources(latex_dir)
+    bib_src = next(p for p in parts if r'\begin{thebibliography}' in p)
+    body = '\n\n'.join(p for p in parts if p is not bib_src)
+    items = re.findall(r'\\bibitem\{([^}]+)\}(.*?)(?=\\bibitem|\\end\{thebibliography\})',
+                       bib_src, flags=re.S)
+    conv = Converter([k for k, _ in items])
+    md = conv.convert(body)
+    refs = '\n'.join(f'<li id="ref-{i}">{conv.inline(t)}</li>' for i, (_, t) in enumerate(items, 1))
+    md = md.replace('\n\n[^1]:', f'\n\n# Referencias\n\n<ol class="refs">\n{refs}\n</ol>\n\n[^1]:', 1) \
+        if conv.footnotes else md + f'\n\n# Referencias\n\n<ol class="refs">\n{refs}\n</ol>'
+    return md.strip() + '\n', conv.ol_types
+
+
+def apply_ol_types(body_html, ol_types):
+    """Python-Markdown no expresa a) / i.: se asigna el tipo a cada <ol> en orden."""
+    it = iter(ol_types)
+    def sub(m):
+        t = next(it, None)
+        return f'<ol type="{t}">' if t else '<ol>'
+    count = body_html.count('<ol>')
+    out = re.sub(r'<ol>', sub, body_html, count=len(ol_types))
+    # el bloque de notas al pie agrega un <ol> propio al final
+    assert count - (1 if 'class="footnote"' in body_html else 0) == len(ol_types), \
+        f'listas ordenadas: {count} en HTML vs {len(ol_types)} en LaTeX'
+    return out
 
 # ═══════════════════════════════════════════════════════════════
-# 2. LIMPIEZA Y NORMALIZACIÓN DEL MARKDOWN
+# 3. book_content.json (estructura {style, text} desde el markdown)
 # ═══════════════════════════════════════════════════════════════
 
-MIME = {'.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif'}
-
-def clean_markdown(raw, media):
-    # 2.1 Spans de dirección RTL que pandoc añade a comillas: [X]{dir="rtl"} → X
-    raw = re.sub(r'\[(.)\]\{dir="[^"]*"\}', r'\1', raw)
-
-    # 2.2 Títulos de capítulo: en el docx usan un estilo propio que pandoc no mapea
-    #     a heading, sino a un span ancla .anchor seguido del texto del título.
-    #     Forma inline:    []{#id .anchor}Capítulo N: ...
-    raw = re.sub(r'(?m)^\[\]\{#\S+ \.anchor\}(.+)$', r'# \1', raw)
-    #     Forma en línea propia: []{#id .anchor}\n\nTítulo
-    raw = re.sub(r'(?m)^\[\]\{#\S+ \.anchor\}\n\n(.+)$', r'# \1', raw)
-    #     Cualquier ancla vacía remanente
-    raw = re.sub(r'(?m)^\[\]\{#\S+ \.anchor\}\s*$\n?', '', raw)
-
-    # 2.3 Eliminar el índice interno del docx (líneas "Texto [pág](#ancla)")
-    raw = re.sub(r'(?m)^.*\[\d+\]\(#[^)]*\)\s*$\n?', '', raw)
-
-    # 2.4 Incrustar imágenes como data URI (self-contained, sin carpeta media/)
-    def embed_image(m):
-        path = m.group(1)
-        name = os.path.basename(path)
-        data = media.get(name)
-        if data is None:
-            return ''
-        ext = os.path.splitext(name)[1].lower()
-        mime = MIME.get(ext, 'application/octet-stream')
-        b64 = base64.b64encode(data).decode('ascii')
-        return f'![](data:{mime};base64,{b64})'
-    raw = re.sub(r'!\[[^\]]*\]\(([^)]+)\)(\{[^}]*\})?', embed_image, raw)
-
-    # 2.45 Tablas grid de pandoc (+---+) → HTML (Python-Markdown no las parsea).
-    #      Se promueve la primera fila a encabezado y se delega el render a pandoc.
-    def convert_grid_table(m):
-        lines = m.group(0).rstrip('\n').split('\n')
-        borders = [i for i, ln in enumerate(lines) if ln.startswith('+')]
-        if len(borders) >= 2:  # 2º borde = separador de encabezado
-            b = borders[1]
-            lines[b] = lines[b].replace('-', '=')
-        block = '\n'.join(lines) + '\n'
-        html = subprocess.run(
-            ['pandoc', '-f', 'markdown', '-t', 'html'],
-            input=block, capture_output=True, text=True, encoding='utf-8'
-        ).stdout.strip()
-        return '\n\n' + html + '\n\n'
-    raw = re.sub(r'(?m)^\+[-=+]+\+\n(?:[|+].*\n)+', convert_grid_table, raw)
-
-    # 2.5 Portada: separar el bloque del título del resto del cuerpo.
-    #     El cuerpo aprovechable empieza en "**Agradecimientos**".
-    agr = raw.find('**Agradecimientos**')
-    if agr > 0:
-        raw = raw[agr:]
-
-    # 2.6 Convertir labels en negrita a headings reales
-    raw = raw.replace('**Agradecimientos**', '## Agradecimientos', 1)
-    raw = raw.replace('**Sobre el autor**',  '## Sobre el autor', 1)
-
-    # 2.7 Normalizar indentación de listas anidadas para Python Markdown (4 espacios)
-    def fix_list_indent(text):
-        def replacer(m):
-            n = len(m.group(1)); marker = m.group(2)
-            level = (n - 1) // 3 + 1
-            return ' ' * (level * 4) + marker + ' '
-        return re.sub(r'(?m)^( {1,11})([-*+]|\d+\.) ', replacer, text)
-    raw = fix_list_indent(raw)
-
-    # 2.8 Tablas de una sola columna (cajas de nota) → divs callout
-    def replace_callout_table(m):
-        return f'\n<div class="callout">{m.group(1).strip()}</div>\n\n'
-    raw = re.sub(r'(?m)^\| (.+?) \|\n\| :---+[^|\n]* \|\n(?!\|)', replace_callout_table, raw)
-
-    # 2.9 Compactar saltos de línea múltiples
-    raw = re.sub(r'\n{3,}', '\n\n', raw).strip() + '\n'
-    return raw
-
-# ═══════════════════════════════════════════════════════════════
-# 3. book_content.json (estructura {style, text} desde el docx)
-# ═══════════════════════════════════════════════════════════════
-
-def build_book_content_json(docx_path):
-    import docx
-    doc = docx.Document(docx_path)
-    style_map = {'Body A': 'normal', 'Normal': 'normal', 'List Paragraph': 'normal',
-                 'Title A': 'Title', 'Title': 'Title', 'Heading': 'Heading 1'}
-    out = []
-    for p in doc.paragraphs:
-        text = p.text.strip()
-        if not text:
+def build_book_content_json(md):
+    out = [{'style': 'Title', 'text': 'Otra coronación de gloria'}]
+    for line in md.split('\n'):
+        line = line.strip()
+        if not line or re.match(r'^\|[\s|-]+\|$', line) or line in ('<ol class="refs">', '</ol>'):
             continue
-        name = p.style.name if p.style else 'Normal'
-        if name.startswith('TOC'):
-            continue
-        style = style_map.get(name, name)
-        out.append({'style': style, 'text': text})
+        m = re.match(r'^(#+) (.*)', line)
+        style = f'Heading {len(m.group(1))}' if m else 'normal'
+        text = m.group(2) if m else re.sub(r'^(?:[-*]|\d+\.|\[\^\d+\]:)\s+', '', line)
+        text = html_module.unescape(re.sub(r'<[^>]+>', '', text)).replace('\\.', '.').strip(' |')
+        if text:
+            out.append({'style': style, 'text': text})
     return out
 
 # ═══════════════════════════════════════════════════════════════
@@ -225,6 +292,10 @@ h4,h5,h6{font-family:'Inter',system-ui,sans-serif;font-size:.88rem;font-weight:6
 p{font-size:var(--fs,1rem);line-height:1.85;margin-bottom:1.15em;text-align:justify;hyphens:auto}
 blockquote{border-left:3px solid var(--accent);padding:.6rem 1.2rem;margin:1.5rem 0;font-style:italic;color:var(--muted)}
 blockquote p{margin-bottom:0}
+.cite{font-size:.75em;vertical-align:super;line-height:0;white-space:nowrap}
+.cite a,.refs a,.footnote a{color:var(--accent)}
+.refs{font-size:.85rem;overflow-wrap:anywhere}
+.footnote{font-size:.85rem;color:var(--muted)}
 .callout{background:var(--sidebar-bg,#f0f4f8);border-left:4px solid var(--accent);padding:.8rem 1.2rem;margin:1.5rem 0;border-radius:0 6px 6px 0;font-size:.92rem;line-height:1.7}
 
 ul,ol{margin:1rem 0 1rem 1.8rem;font-size:var(--fs,1rem);line-height:1.85}
@@ -329,11 +400,11 @@ document.querySelectorAll('#toc-scroll a').forEach(a => a.addEventListener('clic
 # ═══════════════════════════════════════════════════════════════
 
 PORTADA_HTML = """<div id="portada" class="portada">
-  <h1>Otra Coronación de Gloria</h1>
+  <h1>Otra coronación de gloria</h1>
   <div class="divider"></div>
-  <p class="sub">Con los dirigentes a la cabeza<br>o con la cabeza de los dirigentes</p>
-  <p class="attr"><em>– Juan D. Perón</em></p>
-  <p class="author">Maximiliano Schulkin</p>
+  <p class="sub">Con los dirigentes a la cabeza<br>o con la cabeza de los dirigentes.</p>
+  <p class="attr"><em>– J.&#8239;D. Perón</em></p>
+  <p class="author">Maximiliano Aaron Schulkin</p>
 </div>"""
 
 # ═══════════════════════════════════════════════════════════════
@@ -341,18 +412,17 @@ PORTADA_HTML = """<div id="portada" class="portada">
 # ═══════════════════════════════════════════════════════════════
 
 def main():
-    raw_md, media = docx_to_markdown(DOCX)
-    clean = clean_markdown(raw_md, media)
+    clean, ol_types = latex_to_markdown(LATEX_DIR)
 
     with open(MD_OUT, 'w', encoding='utf-8') as f:
         f.write(clean)
 
-    book_json = build_book_content_json(DOCX)
+    book_json = build_book_content_json(clean)
     with open(JSON_OUT, 'w', encoding='utf-8') as f:
         json.dump(book_json, f, ensure_ascii=False)
 
     proc = md_lib.Markdown(extensions=['extra', 'sane_lists', 'toc', 'smarty'])
-    body_html = proc.convert(clean)
+    body_html = apply_ol_types(proc.convert(clean), ol_types)
     toc_sidebar_html = render_toc(proc.toc_tokens)
 
     HTML = f"""<!DOCTYPE html>
@@ -360,7 +430,7 @@ def main():
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Otra Coronación de Gloria — Max Schulkin</title>
+<title>Otra coronación de gloria — Max Schulkin</title>
 <meta name="description" content="Plan de 20 años para transformar Argentina en un país autosuficiente. Por Maximiliano Schulkin.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -371,7 +441,7 @@ def main():
 <div id="pgbar"></div>
 <nav id="sidebar">
   <div id="sb-head">
-    <div class="b-title">Otra Coronación de Gloria</div>
+    <div class="b-title">Otra coronación de gloria</div>
     <div class="b-author">Max Schulkin</div>
   </div>
   <div id="toc-scroll">{toc_sidebar_html}</div>
